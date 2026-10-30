@@ -4,6 +4,45 @@ Status: FlashInfer module validation; vLLM runtime integration is pending and no
 upstream pull request is open. This document is a working design on the
 contribution branch, not a claim that the backend is implemented in this checkout.
 
+## Current module expansion (2026-10-31)
+
+Page16/32/64 and multiple local KV heads with Q/KV ratios4/6/8 have landed in the
+companion FlashInfer branch. The latest validated head expansion is
+[71d60cf1](https://github.com/Nicko-F/flashinfer/commit/71d60cf1f53b73cfc7f74814f003962bca257c9b).
+Fifteen test groups passed, including128 new changed-input Graph subcases; nineteen
+compiled variants reported zero spills. One request plan is shared across head
+groups, while CTA budgets, scratch offsets and completion counters account for
+their independent work. No separate full-SM grid is allocated per head.
+
+For the bounded `65536 + 7 x 4096` two-layer GPU Graph window, the native paired
+mean and planning-inclusive candidate medians were370.370/106.358us forH2/R4,
+728.774/181.571us forH4/R6, and1882.308/532.701us forH8/R8. These are module
+measurements on matched physical GPU/NUMA placement, not model or serving gains.
+
+Uniform query lengths1–5 are validated and published in
+[ec05ef44](https://github.com/Nicko-F/flashinfer/commit/ec05ef44bb2683d3e6e28d0531f085db177150ad).
+One causal smoke and twelve focused groups passed, including future-KV
+perturbations across a tile boundary. All twenty-one compiled variants have zero
+spills. Two-layer mixed-length anchors measured963.250/421.136us forT3/H4/R6/P32
+and2266.026/1251.598us forT5/H8/R8/P64, native paired mean/candidate respectively.
+The [completed22-case representative matrix](https://github.com/Nicko-F/flashinfer/commit/7bd439a07782d25e1bf742e85197dcf35aea62af) uses Tencent's length distributions,
+retaining NVFP4 cache and dimension256, with64-request patterns explicitly adapted
+to the current32-request bound. See the companion
+[benchmark protocol](https://github.com/Nicko-F/flashinfer/blob/feat/sm120-nvfp4-decode-bucketing/docs/benchmark_protocol.md).
+All cases passed output/counter checks; maximum relative RMS was0.004230.
+Seventeen medians were faster and five regressed. The best full-window gain was
+9.59x for q1/one128K+31x4K; balanced T3/R6 regressed to0.56x/0.67x. These are
+single-attention GPU Graph windows, separately reported from the two-layer
+anchors above. The latter regressions already occur in compute, consistent with
+the extra row groups/KV reads needed by M16 for18logical rows versus native M32;
+that is a source-supported explanation, not a complete profiling attribution.
+The original native route remains default. Tile/dispatch decisions, real
+compile/opcheck coverage and framework integration remain subsequent work.
+The baseline in these module tables is the public FlashInfer
+`flashinfer.decode.xqa_batch_decode_with_kv_cache` call with native default
+dispatch, not a running vLLM model/server. Both arms use matched BF16 Q/output,
+NVFP4 KV and the same length, page-table and causal-mask inputs.
+
 ## Preparation checkpoint (2026-10-30)
 
 The source-level FlashInfer module is on the companion contribution branch:
@@ -193,8 +232,9 @@ add a worker scheduler or patch the model forward.
   persistent/aligned experimental choices. Keep the selected compute path stable
   for each captured shape. Do not infer a dynamic routing policy from one timing
   point or change a captured kernel by changing a Python branch after capture.
-- A builder owns cached plans and workspaces keyed by the compatible padded
-  request count and page-table width. Each entry owns stable device lengths;
+- A builder owns cached plans and workspaces keyed by compatible padded request
+  count, page-table width/page size, KV-head count, head ratio, query length and
+  selected mode/planner/device. Each entry owns stable device lengths;
   refresh those from the current metadata, then prepare once before the model
   consumes them. Different builders/microbatches must not overwrite each other's
   pending plans. Sequential compatible layers may share scratch.
@@ -215,17 +255,72 @@ add a worker scheduler or patch the model forward.
   eager/Graph modes, then one real-model entry-point anchor. Full service curves
   come after this module integration is complete.
 
-These are implementation decisions, not completed validation. The first module
-measurements will determine whether either experimental choice is worth promoting.
+These are integration decisions, not completed framework validation. The module
+matrix now demonstrates both useful skewed-load gains and balanced regressions;
+matched framework measurements are still needed before promoting either choice.
 
 ## Initial supported scope
 
-The first specialization may remain deliberately narrow: tested SM120 geometry,
-BF16 Q/output, one query token per request, head dimension 256, Q/KV head ratio
-6 with one local KV head, page size 32, packed NVFP4 KV and its block scales.
-Sliding windows, sinks, soft caps, speculative decode and other unsupported layouts
-retain the native path. These are tensor/kernel constraints, not a Qwen or TP4
-identity check. Batch capacity and supported specialization must be explicit.
+### Validated multi-configuration module (owner, 2026-10-30)
+
+The owner authorized expanding the module before framework integration, including
+multi-query in this first stage. The module now implements:
+page16/32/64, multiple KV heads, Q/KV ratios4/6/8, then uniform query lengths1-5.
+Head dimension stays256; BF16 Q/output and NVFP4 KV remain unchanged. Multi-query
+means a causal suffix already included in KV lengths, not an enabled speculative
+generation service. Ragged query lengths and arbitrary tree masks are outside this
+first slice. Test KV head counts1/2/4/8; retain the explicit B<=32 module bound.
+
+Lead source review: Tencent's SM90 dynamic BF16 launcher specializes page16/32/64
+and query1-5, using TileM8/16/24/32/40. Its task assignment accepts multiple KV
+heads. Native FlashInfer XQA exposes page templates, multiple head addressing, and
+`SPEC_DEC` row mapping/masking/output. On SM120 the applicable core is `mha.cu`;
+do not copy SM90 GMMA/TMA resource assumptions. References are the Tencent
+`smallm_bf16_dim128_dynamic.cu` and `assign_task.cu` at the revision linked above,
+and the current FlashInfer `csrc/xqa/{mha.cu,mha.h,defines.h,specDec.h}`.
+
+Approved dataflow and resource model:
+
+- Page sizes divide the unchanged256-token KV tile. Parameterize allocation,
+  capacity bounds, addressing and JIT keys without altering warp ownership.
+- Reuse one request interval plan across independent KV-head/query-row groups;
+  all groups see the same request lengths. Partition the device CTA budget among
+  groups rather than allocating a full-SM grid per head. A launch may still need
+  more than one wave when the number of independent outputs exceeds the SM count.
+- For G groups, target `ceil(SMs/G)` CTAs per group, retaining enough owners for
+  the existing request/zero-row contract. Each group owns distinct scratch slots
+  and request completion counters. Share only the immutable task descriptors.
+  Derive cache head strides from input tensors; never replicate KV caches.
+- Q/KV ratios4/6/8 fit the existing padded16-row tile. Recompile each needed
+  specialization and verify generated resources rather than assuming identical
+  register counts. Preserve the native upstream default entry points.
+- For multiple queries, first reuse `SPEC_DEC` with `M_TILESIZE=16` and split
+  the head-token rows into `ceil(query_length*ratio/16)` blocks per KV head.
+  This retains the existing physical MMA tile and256-thread layout instead of
+  doubling the row tile without a resource budget. Larger row tiles are not
+  part of this initial extension. Query length can remain a runtime parameter
+  within the multi-query specialization if no compiled arithmetic depends on it.
+- Separate the full logical KV length (which locates the causal suffix) from a
+  task's KV interval end. A task boundary must never be mistaken for the start
+  of the draft block. Reuse native mask/output mappings with explicit task group
+  identity rather than native grid dimensions. Cover causal suffixes crossing
+  page/tile boundaries and partial rows with no visible keys.
+
+Per-slice cadence: local implementation/review, focused GPU correctness and a few
+matched timings, then record/commit. At stage completion cover the supported
+configuration combinations for correctness and choose representative shapes for
+Tencent length-pattern performance comparisons, with native controls and clear
+planning-cost windows. Do not run the full service matrix for each patch. Keep
+Host/GPU planning options; GPU remains default. No universal non-regression claim
+follows from support for a shape.
+
+The initial specialization was q1, ratio6, KV-head1 and page32. The module has now
+expanded as described above; focus-tested shape combinations and measured
+performance coverage are documented separately. Sliding windows, sinks, soft
+caps, ragged queries, tree masks and unsupported layouts retain the native path.
+The first framework integration can still start with q1. These are tensor/kernel
+constraints, not a Qwen or TP4 identity check. Batch capacity and supported
+specialization must be explicit.
 
 Retain the audited persistent kernel's actual thread/barrier and shared-memory
 constraints. Do not widen its eligibility by merely deleting assertions. Derive
