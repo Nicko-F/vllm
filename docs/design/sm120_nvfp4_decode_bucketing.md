@@ -82,7 +82,7 @@ substitutions and a private ctypes/JIT wrapper. That is not the intended upstrea
 implementation. Replace the substitutions with explicit source-level task/range
 interfaces, preserving the original native entry and native QK/PV mathematics.
 
-FlashInfer owns device task assignment, persistent compute, partial storage and
+FlashInfer owns host/device task planning, persistent compute, partial storage and
 merge, native bindings, compilation, capability checks and workspace API. Use its
 existing JIT/FFI infrastructure. Its experimental-backend policy is a possible
 initial landing path, subject to maintainer review; no acceptance is assumed.
@@ -128,6 +128,59 @@ after the source-level module measurements, rather than copying an unverified
 research dispatch threshold.
 
 This is an integration design, not an implemented or measured vLLM path yet.
+
+### Host or GPU planning (owner decision, 2026-10-30)
+
+Keep both explicit planning options. GPU Assign consumes device lengths; Host
+planning consumes caller-provided exact CPU lengths and uploads descriptors before
+the compute Graph replays. Both use the same task ownership and compute kernel.
+Stable task-buffer addresses allow the Host path to refresh contents without
+recapturing the Graph. CPU planning must run each forward outside capture, never
+only when the graph is first recorded. Retain the existing direct no-plan path.
+
+The current `FlashInferMetadataBuilder.build()` already treats
+`common_attn_metadata.seq_lens_cpu_upper_bound` as exact when
+`_num_speculative_tokens == 0`. The runner constructs that CPU metadata before
+building attention metadata. This is the intended source for the initial q1,
+non-speculative Host path; do not introduce a GPU-to-CPU length readback. Async
+speculative decoding may correct those optimistic lengths on GPU and is outside
+this contribution's scope. The Host module passed eleven focused tests, including
+both-mode changed-input Graph replay and CPU/GPU descriptor comparisons. Framework
+integration and end-to-end gains remain pending.
+
+Use the Tencent HPC-Ops decode benchmark's sequence-length distributions for
+subsequent workload selection, retaining our own supported tensor geometry and
+NVFP4 cache format. Label batch-size adaptations explicitly (for example, its
+64-request uniform case reduced to our current 32-request limit). Report planning
+and compute-only windows separately and also completed wall time including CPU
+planning, descriptor upload and Graph replay. A shorter GPU-only window is not
+evidence that the full Host path is faster. Keep the existing small regression
+tests; do not build another benchmarking framework.
+
+Reference: [Tencent length cases and task-map timing switch](https://github.com/Tencent/hpc-ops/blob/2a2e26562433a8ba4b504858f1c938eb7612c901/benchmark/attention_decode/bench_attention_decode_bf16.py).
+
+The bounded two-layer, static-metadata comparison found that the standalone Host
+path is slower. Completed wall times in microseconds were:
+
+| Length pattern | GPU plan inside Graph | GPU plan before Graph | Host fill + H2D + Graph |
+| --- | ---: | ---: | ---: |
+| 32 x 4096 | 76.040 | 82.297 | 93.134 |
+| 65536 + 7 x 4096 | 83.835 | 90.809 | 102.408 |
+| 131072 + 31 x 4096 | 150.187 | 156.988 | 166.353 |
+| 512, direct control | 30.341 | 30.446 | 30.648 |
+
+The first column averages the before/after GPU medians; the others are medians.
+All arms used the same GPU/NUMA placement and operands, five warmups and twenty
+samples. Lengths were already resident and static during timing on both sides;
+these are completed module wall windows, not serving latency. CPU C++/FFI fill
+was 1.68-2.66 us and the standalone descriptor-copy completed-wall measurement was
+8.06-8.78 us. Those component measurements have different synchronization windows
+and should not be summed as an exact decomposition. Compute-only GPU times match
+closely. Retain both options and GPU as the default. A future Host integration
+could combine task uploads with existing metadata transfers, but no such benefit
+has been measured or claimed here.
+
+Implementation and module report: [FlashInfer d6e5d2c](https://github.com/Nicko-F/flashinfer/commit/d6e5d2c8208174e0198e2ac207b9b92280cf641b).
 
 ### First integration decisions
 
