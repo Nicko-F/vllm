@@ -13,12 +13,21 @@ package JIT/FFI bindings, changed-input Graph tests, and a matched native/bucket
 module example. No runtime source rewriting or private path/hash gates remain in
 this new implementation.
 
-The host arithmetic regression and Ruff passed. GPU tests were skipped locally,
-not passed. Two source-transfer attempts to the test machine failed during SSH
-verification/finalization; source-package import, CUDA compilation, Graph replay
-and performance measurements have not run. The vLLM runtime integration has not
-started. Next: finish source transfer, run the bounded module Graph test and
-matched timing, then integrate at the metadata boundary described below.
+Source delivery has recovered. Source-package import, CUDA compilation and all
+six focused FlashInfer tests passed on SM120, including changed-input Graph
+replay. Seven matched two-layer timing windows show gains for skewed lengths,
+but regressions for short and uniform inputs; see the companion module's
+[validation table](https://github.com/Nicko-F/flashinfer/blob/feat/sm120-nvfp4-decode-bucketing/flashinfer/experimental/xqa_decode_buckets/README.md).
+The example's explicit-device/seed fix is commit `71cb089` in that fork.
+
+The vLLM runtime integration has not started. Before integration, isolate the
+B=1/L=512 regression: persistent takes 34.986 us versus native 23.525 us for two
+layers; aligned takes 25.973 us versus 23.517 us. The persistent planner assigns
+both tiles to one active CTA, while native uses two. These are measured complete
+windows plus a source-derived topology explanation, not yet a measured component
+breakdown. This port retains native QK/PV and does not include the separate
+Q6-to-N8 transposed Compute proposal. Do not attribute that proposal's potential
+gain to the current implementation or claim universal improvement.
 
 ## Repository and branch policy
 
@@ -84,6 +93,42 @@ after the source-level module measurements, rather than copying an unverified
 research dispatch threshold.
 
 This is an integration design, not an implemented or measured vLLM path yet.
+
+### First integration decisions
+
+Source review confirms that `GPUModelRunner._build_attention_metadata()` assigns
+one builder result to every layer in its attention group. The initial integration
+therefore stays inside the existing FlashInfer builder/implementation; it does not
+add a worker scheduler or patch the model forward.
+
+- Use an explicit attention configuration with native as the default and separate
+  persistent/aligned experimental choices. Keep the selected compute path stable
+  for each captured shape. Do not infer a dynamic routing policy from one timing
+  point or change a captured kernel by changing a Python branch after capture.
+- A builder owns cached plans and workspaces keyed by the compatible padded
+  request count and page-table width. Each entry owns stable device lengths;
+  refresh those from the current metadata, then prepare once before the model
+  consumes them. Different builders/microbatches must not overwrite each other's
+  pending plans. Sequential compatible layers may share scratch.
+- Preserve the existing q_len=1 XQA padding convention: query/output views cover
+  `num_decodes`, which may exceed `num_decode_tokens`. Zero-length padded rows
+  remain zero-length. Test refresh after request reordering, length growth and
+  removal, including returning to a previously captured batch size.
+- Reuse `_nvfp4_kv_views()` and the existing effective BMM1/BMM2 scales. Its views
+  split each page's contiguous data and scale regions; do not repack the cache or
+  add an intermediate dequantization allocation. Unsupported geometry/features
+  use the original native route. Missing experimental dependency support must
+  be reported clearly when the option is requested.
+- Prepare/JIT outside graph capture; attention forward only consumes the plan.
+  Measure external length refresh and planning as part of the integration cost.
+  Module graphs that capture planning internally are a different timing window.
+- Extend the nearby FlashInfer NVFP4 attention tests using real builders and
+  implementations. First validate two compatible layers and changing metadata in
+  eager/Graph modes, then one real-model entry-point anchor. Full service curves
+  come after this module integration is complete.
+
+These are implementation decisions, not completed validation. The first module
+measurements will determine whether either experimental choice is worth promoting.
 
 ## Initial supported scope
 
@@ -152,3 +197,4 @@ understand the patch. Do not present pending tests as passed.
 - [FlashInfer XQA JIT construction](https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/jit/xqa.py)
 
 Source revisions are recorded by Git history, not enforced by application code.
+
