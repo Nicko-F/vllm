@@ -4,6 +4,22 @@ Status: preparation; no upstream pull request opened and no upstream-package
 validation claimed. This document is a working design on the contribution branch,
 not a claim that the backend is implemented in this checkout.
 
+## Preparation checkpoint (2026-10-30)
+
+The source-level FlashInfer module is on the companion contribution branch:
+[implementation commit](https://github.com/Nicko-F/flashinfer/commit/9c62c3bfb401bcb87cd265ed7fecfd4650557d41).
+It includes optional native task-context hooks, a separate planner/workspace API,
+package JIT/FFI bindings, changed-input Graph tests, and a matched native/bucket
+module example. No runtime source rewriting or private path/hash gates remain in
+this new implementation.
+
+The host arithmetic regression and Ruff passed. GPU tests were skipped locally,
+not passed. Two source-transfer attempts to the test machine failed during SSH
+verification/finalization; source-package import, CUDA compilation, Graph replay
+and performance measurements have not run. The vLLM runtime integration has not
+started. Next: finish source transfer, run the bounded module Graph test and
+matched timing, then integrate at the metadata boundary described below.
+
 ## Repository and branch policy
 
 - vLLM integration: `Nicko-F/vllm:feat/sm120-nvfp4-decode-bucketing`
@@ -47,6 +63,27 @@ worker monkeypatches or introducing another scheduler/framework.
 An implementation with per-layer planning cannot inherit measurements from the
 shared-plan research implementation. Count assignment, compute, merge and dispatch
 costs in comparisons.
+
+### Native integration boundary under review
+
+The current vLLM `FlashInferMetadataBuilder.build()` creates Decode metadata once
+per attention group. The worker shares that metadata across the group's layer
+names. This is the intended plan-preparation boundary; the attention forward path
+should only consume the prepared plan and its workspace.
+
+The first integration should refresh stable device length buffers and prepare the
+plan before replaying the model Graph. Do not retain a stale tensor view from the
+first captured batch. Count the preparation launch and any metadata copy in model
+timing: this boundary differs from the historical captured planning prelude.
+
+Capture compatibility must cover changed request order, lengths, page IDs and
+padding. Selection between persistent, aligned and native kernels must also be
+compatible with the captured graph; changing a Python branch outside capture
+does not change the kernels already recorded inside it. Decide that selection
+after the source-level module measurements, rather than copying an unverified
+research dispatch threshold.
+
+This is an integration design, not an implemented or measured vLLM path yet.
 
 ## Initial supported scope
 
