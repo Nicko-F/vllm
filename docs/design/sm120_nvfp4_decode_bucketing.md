@@ -1,8 +1,8 @@
 # SM120 NVFP4 Decode bucketing contribution plan
 
-Status: preparation; no upstream pull request opened and no upstream-package
-validation claimed. This document is a working design on the contribution branch,
-not a claim that the backend is implemented in this checkout.
+Status: FlashInfer module validation; vLLM runtime integration is pending and no
+upstream pull request is open. This document is a working design on the
+contribution branch, not a claim that the backend is implemented in this checkout.
 
 ## Preparation checkpoint (2026-10-30)
 
@@ -36,14 +36,33 @@ change. The full plan-plus-compute window is still 26.589 us (+12.1%); this
 remaining integration cost is unresolved, so no small-load speedup is claimed.
 The reviewed correction is [FlashInfer commit d632c9c](https://github.com/Nicko-F/flashinfer/commit/d632c9c4541956fccf68773b4db187b8b5668a79).
 
-The next bounded module change will cap the fixed launch grid by the static
-page-table capacity and derive B=1 task geometry directly from the live device
-length. A single request does not require cross-request bucket assignment.
-The proposed direct path retains the native XQA arithmetic and merge, removes
-the per-forward assignment launch, and must handle changed lengths and zero
-rows during Graph replay without a device-to-host synchronization. This is
-pending implementation and measurement, not a reported gain. Larger batches
-retain global interval assignment; no unmeasured dispatch threshold is added.
+The following checkpoint, [FlashInfer ab14b59](https://github.com/Nicko-F/flashinfer/commit/ab14b59656feb7ebcba606021fbd0571a2f192e7),
+caps the fixed grid by static page-table capacity and derives B=1 task geometry
+from live device length without assignment. Eight focused test groups passed,
+including changing lengths, zero/restore and page updates under Graph replay.
+It measured about 3.01x for live length512 with table capacity128K; tight B1
+still regressed 2.7-3.1%, and four short requests still regressed 17.8%.
+
+The direct path now supports the structural condition
+`B == 1 or B * ceil(table_width * 32 / 256) <= SMs`. For the second case, every
+potential tile already fits the available CTA budget: direct `(tile, request)`
+grid coordinates remove assignment and task-list traversal. Longer multi-request
+work retains the shared interval plan. Eligibility depends only on static shape
+and device properties, so it cannot change silently during Graph replay; no
+device-to-host length read or tuned load threshold is introduced. Both paths
+retain native XQA arithmetic and merge.
+
+The extended module passed all eight focused test groups. Matched two-layer
+complete Graph windows are 21.469 us for B1/256, 23.822 us for B1/512 and 23.874 us
+for four 512-token requests, versus paired native means of 21.261/23.629/23.650 us.
+Residual regressions are 0.8-1.0%, not a universal non-regression pass. B1 with a
+512-token live prefix and 128K table capacity measures 23.310 us versus 70.822 us
+native (about 3.04x). Both sides retain the same table capacity. These are module
+results, not vLLM serving results; actual framework table width matters. Wide
+multi-request tables and prepared uniform workloads still need integration
+coverage. The current direct kernel uses 186 registers and has zero compiler
+spill loads/stores. See the companion module report for full paired results.
+The tested extension is [FlashInfer commit 2d81984](https://github.com/Nicko-F/flashinfer/commit/2d819842ee8915b7bab623bcf77a1a575aacf132).
 
 ## Repository and branch policy
 
