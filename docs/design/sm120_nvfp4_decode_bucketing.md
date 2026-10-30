@@ -20,14 +20,30 @@ but regressions for short and uniform inputs; see the companion module's
 [validation table](https://github.com/Nicko-F/flashinfer/blob/feat/sm120-nvfp4-decode-bucketing/flashinfer/experimental/xqa_decode_buckets/README.md).
 The example's explicit-device/seed fix is commit `71cb089` in that fork.
 
-The vLLM runtime integration has not started. Before integration, isolate the
-B=1/L=512 regression: persistent takes 34.986 us versus native 23.525 us for two
+The vLLM runtime integration has not started. The initial
+B=1/L=512 measurement was 34.986 us versus native 23.525 us for two
 layers; aligned takes 25.973 us versus 23.517 us. The persistent planner assigns
 both tiles to one active CTA, while native uses two. These are measured complete
-windows plus a source-derived topology explanation, not yet a measured component
-breakdown. This port retains native QK/PV and does not include the separate
+windows; the follow-up component measurements are below.
+This port retains native QK/PV and does not include the separate
 Q6-to-N8 transposed Compute proposal. Do not attribute that proposal's potential
 gain to the current implementation or claim universal improvement.
+
+Follow-up diagnosis measured persistent compute alone at 32.454 us. Allowing
+one-tile buckets restores two active owners and reduces compute to 23.722 us,
+matching the same-run native 23.718 us. All six focused tests pass after the
+change. The full plan-plus-compute window is still 26.589 us (+12.1%); this
+remaining integration cost is unresolved, so no small-load speedup is claimed.
+The reviewed correction is [FlashInfer commit d632c9c](https://github.com/Nicko-F/flashinfer/commit/d632c9c4541956fccf68773b4db187b8b5668a79).
+
+The next bounded module change will cap the fixed launch grid by the static
+page-table capacity and derive B=1 task geometry directly from the live device
+length. A single request does not require cross-request bucket assignment.
+The proposed direct path retains the native XQA arithmetic and merge, removes
+the per-forward assignment launch, and must handle changed lengths and zero
+rows during Graph replay without a device-to-host synchronization. This is
+pending implementation and measurement, not a reported gain. Larger batches
+retain global interval assignment; no unmeasured dispatch threshold is added.
 
 ## Repository and branch policy
 
@@ -197,4 +213,3 @@ understand the patch. Do not present pending tests as passed.
 - [FlashInfer XQA JIT construction](https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/jit/xqa.py)
 
 Source revisions are recorded by Git history, not enforced by application code.
-
