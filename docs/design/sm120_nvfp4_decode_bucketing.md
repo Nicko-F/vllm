@@ -43,6 +43,18 @@ The baseline in these module tables is the public FlashInfer
 dispatch, not a running vLLM model/server. Both arms use matched BF16 Q/output,
 NVFP4 KV and the same length, page-table and causal-mask inputs.
 
+The [explicit M32 option](https://github.com/Nicko-F/flashinfer/commit/753cc23be1005650678c220c72d29a0421c3ebe3) reuses native SPEC_DEC and keeps M16/default
+dispatch unchanged. It passed58 focused GPU cases plus7 CPU groups; nine M32
+compiled variants have zero spills,219–235 registers/thread and86656B shared
+memory. Four matched single-attention windows compare M16 -> M32 full latency:
+T3/R6 uniform51243.382 ->31.914us, uniform4096239.259 ->232.259us,
+one64k+7x4k213.059 ->113.219us, and T5/R8 one64k+7x4k627.370 ->605.590us.
+The T3 mixed case is4.26x faster than native, but both balanced T3 cases remain
+slower. In uniform4096 even compute-only is224.323us against160.989us native;
+removing Assign alone cannot close that gap. Inspect native split/grid and bucket
+ownership/merge before changing scheduling. Real compile and vLLM integration
+remain unvalidated; source-level registration decorators are no proof of either.
+
 ## Preparation checkpoint (2026-10-30)
 
 The source-level FlashInfer module is on the companion contribution branch:
@@ -297,8 +309,10 @@ Approved dataflow and resource model:
 - For multiple queries, first reuse `SPEC_DEC` with `M_TILESIZE=16` and split
   the head-token rows into `ceil(query_length*ratio/16)` blocks per KV head.
   This retains the existing physical MMA tile and256-thread layout instead of
-  doubling the row tile without a resource budget. Larger row tiles are not
-  part of this initial extension. Query length can remain a runtime parameter
+  doubling the row tile without a resource budget. The later explicit M32 slice
+  above supplies that budget and focused evidence; it uses
+  `ceil(query_length*ratio/query_tile)` groups and tile-specific workspace/JIT.
+  Query length can remain a runtime parameter
   within the multi-query specialization if no compiled arithmetic depends on it.
 - Separate the full logical KV length (which locates the causal suffix) from a
   task's KV interval end. A task boundary must never be mistaken for the start
