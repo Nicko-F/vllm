@@ -1,0 +1,117 @@
+# SM120 NVFP4 Decode bucketing contribution plan
+
+Status: preparation; no upstream pull request opened and no upstream-package
+validation claimed. This document is a working design on the contribution branch,
+not a claim that the backend is implemented in this checkout.
+
+## Repository and branch policy
+
+- vLLM integration: `Nicko-F/vllm:feat/sm120-nvfp4-decode-bucketing`
+  targets `vllm-project/vllm:main`.
+- Kernel dependency: `Nicko-F/flashinfer:feat/sm120-nvfp4-decode-bucketing`
+  targets `flashinfer-ai/flashinfer:main`.
+- Fork main branches track upstream; keep contribution commits on feature
+  branches. Do not merge the research repository's history into either fork.
+- Keep Prefill, pipeline parallelism, P/D transport and unrelated model kernels
+  outside this contribution. Do not publish experimental raw directories here.
+
+## Contribution boundary
+
+The existing research implementation adapts native XQA through generated source
+substitutions and a private ctypes/JIT wrapper. That is not the intended upstream
+implementation. Replace the substitutions with explicit source-level task/range
+interfaces, preserving the original native entry and native QK/PV mathematics.
+
+FlashInfer owns device task assignment, persistent compute, partial storage and
+merge, native bindings, compilation, capability checks and workspace API. Use its
+existing JIT/FFI infrastructure. Its experimental-backend policy is a possible
+initial landing path, subject to maintainer review; no acceptance is assumed.
+
+vLLM owns opt-in configuration, capability-based dispatch and the metadata/workspace
+lifecycle. Extend its existing FlashInfer backend rather than injecting project
+worker monkeypatches or introducing another scheduler/framework.
+
+## Dataflow and reuse
+
+1. Build one interval task plan per compatible Decode metadata group per forward.
+2. Reuse that plan across attention layers sharing the same request order and live
+   KV lengths; do not assume a fixed number of layers.
+3. Keep layer Q, KV and output pointers independent. Sequential layers may reuse
+   scratch only after the previous compute/merge completes.
+4. On Graph replay, stable buffer addresses hold refreshed live metadata. Planning
+   must execute at the correct per-forward boundary, not once at capture time or
+   independently for every layer.
+5. Preserve native normalized BF16 partial output plus FP32 max/sum merge semantics,
+   independent effective BMM1/BMM2 scales and proper PDL acquire/completion ordering.
+
+An implementation with per-layer planning cannot inherit measurements from the
+shared-plan research implementation. Count assignment, compute, merge and dispatch
+costs in comparisons.
+
+## Initial supported scope
+
+The first specialization may remain deliberately narrow: tested SM120 geometry,
+BF16 Q/output, one query token per request, head dimension 256, Q/KV head ratio
+6 with one local KV head, page size 32, packed NVFP4 KV and its block scales.
+Sliding windows, sinks, soft caps, speculative decode and other unsupported layouts
+retain the native path. These are tensor/kernel constraints, not a Qwen or TP4
+identity check. Batch capacity and supported specialization must be explicit.
+
+Retain the audited persistent kernel's actual thread/barrier and shared-memory
+constraints. Do not widen its eligibility by merely deleting assertions. Derive
+SM count and launch/workspace parameters from hardware and shapes; do not fix a
+physical GPU ordinal or assume 170 SMs.
+
+## Portability requirements
+
+- No personal paths, environment names, run directories or mandatory receipts in
+  library code. Discover package assets/cache through standard upstream mechanisms.
+- No exact source-hash or Git-revision runtime gate. Check necessary API and layout
+  contracts; record revisions only as provenance.
+- Normal content-addressed JIT caching and ordinary dependency lockfiles remain
+  valid mechanisms, not runtime access restrictions.
+- Remove incidental 128K model limits and exactly-16-layer assumptions. Keep actual
+  integer, allocation and supported-kernel bounds documented.
+- Keep Graph capture sizes separate from kernel eligibility.
+- Caller-owned workspaces must document concurrency and stream ordering.
+- Keep local experiment admission and memory safeguards outside reusable kernels.
+
+## Bounded migration sequence
+
+1. Source-level FlashInfer implementation and public package binding. Preserve
+   native default, add explicit opt-in, port nearby tests instead of creating a
+   second test or execution framework.
+2. Package build, numerical tolerance checks and changed-input Graph replay.
+   Inspect resources; measure matched module latency including plan frequency.
+3. Native vLLM metadata/dispatch integration, then one targeted real-model lifecycle
+   and Graph anchor with native fallback. Do not run full service curves per patch.
+4. At integration completion, run representative small, uniform and skewed Decode
+   workloads through existing benchmarks and one matched service comparison.
+   Report variation and tails; no universal speedup or bitwise-equivalence claim.
+
+## Existing evidence versus work still required
+
+Historical kernel, Graph and service tests motivate this contribution. They do not
+validate the new upstream package build or new metadata lifecycle.
+
+Reuse existing behavioral coverage for unique tile ownership, zero rows, page/tile
+tails, nontrivial quantization scales, padding, scratch capacity, changed lengths,
+Graph replay and fallback. Replace tests of source-string substitution with tests
+of actual package behavior. Add binding mutation/fake/meta/opcheck coverage as
+required by the selected upstream interface.
+
+Before submission: check open issues/PRs for overlapping work; use the repository
+PR template; run relevant lint and tests; document visible configuration and
+supported hardware; retain original licensing/attribution; include AI assistance
+and the human contributor's DCO signoff. The human submitter must review and
+understand the patch. Do not present pending tests as passed.
+
+## References
+
+- [vLLM contribution policy](https://docs.vllm.ai/en/latest/contributing/)
+- [vLLM agent contribution requirements](https://github.com/vllm-project/vllm/blob/main/AGENTS.md)
+- [vLLM FlashInfer backend](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flashinfer.py)
+- [FlashInfer contribution policy](https://github.com/flashinfer-ai/flashinfer/blob/main/CONTRIBUTING.md)
+- [FlashInfer XQA JIT construction](https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/jit/xqa.py)
+
+Source revisions are recorded by Git history, not enforced by application code.
