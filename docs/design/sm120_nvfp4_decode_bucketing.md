@@ -368,6 +368,38 @@ physical GPU ordinal or assume 170 SMs.
 
 ## Bounded migration sequence
 
+### Compile boundary qualified before runtime migration (2026-10-31)
+
+FlashInfer's experimental backend now registers real torch.library plan/compute
+operators locally, with explicit mutable arguments and fake implementations.
+It preserves raw eager execution and leaves shared registration decorators and
+native dispatch unchanged. Actual default Inductor `fullgraph=True` calls and
+changed-input CUDA Graph replay passed for direct q1, both prepared M32 modes,
+Host preparation outside a compiled consumer and two compatible attention
+layers sharing one GPU plan. The two-layer graph has one plan and two compute
+ops, not two per-layer plans. It is not yet a vLLM model integration.
+
+Inspected generated code has no unconditional capacity-workspace copies; its
+read-only inputs use conditional alignment copies. Eager rejects misaligned
+storage, while Inductor can realign inputs. PyTorch's FP8 schema checker hits an
+unsupported allclose/mul operation, reported separately from passing fake checks,
+plan schema checks and explicit read-only-input mutation checks. Do not describe
+this as all opcheck subtests passing or bitwise numerical equivalence.
+
+The bounded timing protocol compares a two-attention native window, eager
+per-layer planning, eager once-per-window planning and compiled once-per-window
+planning on matched GPU/NUMA placement. It precedes the runtime metadata lifecycle
+work below; no service improvement or upstream PR acceptance follows from it.
+
+Measured once on matched GPU7/NUMA1: B32 x 4096, H4/R6/P32/T3/M32 aligned,
+two independent attention layers. Native before/after 317.920/322.730 us;
+per-layer planning 337.066 us; shared eager planning 330.102 us; shared compiled
+planning 331.997 us. Shared planning saves 2.07% in this invocation, but eager and
+compiled shared windows remain 3.05% and 3.64% slower than the native mean 320.325 us.
+The 1.50% native bracket drift does not support interpreting the 0.57% compiler
+difference as stable overhead or gain. Do not run full curves to chase it.
+The next task is framework metadata lifecycle/native fallback integration.
+
 1. Source-level FlashInfer implementation and public package binding. Preserve
    native default, add explicit opt-in, port nearby tests instead of creating a
    second test or execution framework.
