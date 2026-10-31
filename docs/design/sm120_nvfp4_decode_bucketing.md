@@ -55,6 +55,17 @@ removing Assign alone cannot close that gap. Inspect native split/grid and bucke
 ownership/merge before changing scheduling. Real compile and vLLM integration
 remain unvalidated; source-level registration decorators are no proof of either.
 
+The [ownership diagnosis](https://github.com/Nicko-F/flashinfer/commit/3aa1974545599c6b6619f19628cb2c25232109ca) compared existing persistent/aligned M32 on
+matched GPU7/NUMA1, independently of the earlier GPU0 timings. For uniform4096,
+actual persistent descriptors split each request into two partials and assign
+two tasks to21 of43 owners/group. Aligned keeps32 complete requests/group.
+Compute falls221.099 ->161.245us versus native158.789us; full aligned168.824us
+still trails native6.32%. Mixed T3 favors persistent111.582us over aligned
+173.432us, so no global mode switch follows. Four output/counter checks passed;
+kernel/API/defaults are unchanged. Retain both explicit choices, qualify actual
+compile and plan reuse across layers, then evaluate metadata-driven routing.
+No GPU length readback, per-shape timing table or automatic routing was added.
+
 ## Preparation checkpoint (2026-10-30)
 
 The source-level FlashInfer module is on the companion contribution branch:
