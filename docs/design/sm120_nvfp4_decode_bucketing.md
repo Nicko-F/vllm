@@ -1,10 +1,12 @@
 # SM120 NVFP4 Decode bucketing contribution plan
 
-Status (2026-11-02): the opt-in q1 vLLM metadata/consumer integration passed its
-16-case real builder/consumer GPU lifecycle suite, including CUDA Graph replay.
-Static and CPU configuration checks also pass. Model validation and timing remain
-pending; these layer-level checks do not establish model or serving speedups.
-No upstream pull request is open and the native default is unchanged.
+Status (2026-11-02): the opt-in q1 integration passed its 16-case real
+builder/consumer GPU lifecycle suite and real-model generation anchors for native,
+persistent and aligned modes. One bounded official completed-generation latency
+comparison is complete: observed mean latency reductions were 1.06% and 1.73%
+for persistent and aligned against the paired native mean. These results do not
+establish a serving speedup or universal dispatch policy. No upstream pull request
+is open; native remains default. This bounded round is stopped at the owner's request.
 
 ## Current module expansion (2026-10-31)
 
@@ -516,6 +518,140 @@ FlashInfer builds can skip them. This local 5090 result does not establish an
 upstream SM120 CI runner; appropriate CI hardware/dependency provisioning still
 needs maintainer agreement. A real-model entry-point check and matched timing
 including metadata refresh/planning remain the next bounded work.
+
+### Real-model anchor and completed-call timing (2026-11-02)
+
+The completed official `vllm.benchmarks.latency.main` workload used B8,
+input4096/output128, two warmups and ten measured batches per arm. It retained
+prefill, scheduling, metadata/planning, decode and detokenization inside the
+completed-generation window. The single GPU and NUMA CPU binding, model,
+engine configuration, thread limits and seeded input were matched. Whole-model
+Torch compilation was NONE, with FULL_DECODE_ONLY CUDA Graphs at 1/2/4/8.
+This is an explicit common execution configuration, not a claim about all
+default vLLM deployments or TP4 serving.
+
+| Run order / mode | Mean seconds per completed batch | Median seconds | Sample standard deviation |
+| --- | ---: | ---: | ---: |
+| Native before | 6.765350 | 6.738725 | 0.149608 |
+| Persistent | 6.702766 | 6.702844 | 0.008441 |
+| Aligned | 6.657453 | 6.654146 | 0.006940 |
+| Native after | 6.783653 | 6.761736 | 0.153808 |
+
+The paired native mean is 6.774502 seconds. Relative mean latency reductions are
+1.058910% for persistent and 1.727784% for aligned. Native before/after mean drift
+is +0.270537%; median drift is +0.341468%. All 40 measurements are retained, including the slower native
+samples around 7.18 and 7.21 seconds; no outlier rejection was applied. The four
+seeded-input state checks passed. These are small observed whole-call gains for
+one uniform-length workload, not an isolated attention/Assign attribution,
+repeated multi-session confidence estimate or universal dispatch threshold.
+
+Native-before, persistent, aligned and native-after run IDs end in
+20261101T174843Z, 20261101T175136Z, 20261101T175435Z and 20261101T175729Z,
+respectively. Local preparation evidence retains all raw samples, command/config
+records, logs, source snapshots, anchor JSON and failed setup attempts. These
+private artifacts are not published into this contribution fork. Lead review
+independently recomputed statistics from all 40 raw samples, compared the four
+input-token arrays and common engine options, and checked placement and cleanup.
+The runtime integration and kernels did not change during this comparison.
+After the final run, the selected GPU was at zero allocated MiB and no owned
+model job remained; available host memory was about 921.46 GiB. No further
+experiments, full service curves or upstream PR were started in this round.
+
+The native, persistent and aligned anchors completed on the same SM120 GPU and
+NUMA placement, using the existing NVFP4 mixed-precision checkpoint. Each handled
+request groups of 4, 1, 3 and 4, with eight generated tokens per request. All
+returned logprobs were finite. Both candidates produced the same 96 greedy tokens
+as native. Across 470 shared top-k logprobs, RMS difference was 0.398426 and maximum
+absolute difference 3.624825; for the 96 selected-token logprobs, RMS was 0.049890
+and maximum 0.322319. The first output position matched exactly; larger differences
+occurred at later positions, mostly on unselected tokens. This is a bounded
+generation check, not proof of distribution equality or a broad quality benchmark.
+No cause is assigned to those differences without further measurements.
+
+Read-only worker RPC confirmed the real V1 runner, whole-model compilation mode
+NONE and FULL_DECODE_ONLY graphs at batch sizes 1/2/4/8. All 16 full-attention
+layers shared one FlashInfer builder. The hybrid cache manager used block size
+2784, but the actual attention kernel used page32 with table width348, Hq24/Hkv4,
+D256, BF16 query and NVFP4 KV. Native had no bucket entries. Both candidates had
+stable plan/scratch addresses for all four captured sizes; B1 was direct, while
+B2/B4/B8 used prepared plans. Live lengths changed across generations and request
+reordering. The three-request group exercised observed B2/B1 scheduling; it does
+not establish B3-to-B4 padding, which remains covered by the earlier layer suite.
+Scratch sizes for B1/B2/B4/B8 were 574464/586752/614400/666624 bytes per entry.
+
+Cold setup needed the official precompiled wheel's bundled Python modules, a
+short workspace-local VLLM_RPC_BASE_PATH, and the official callable-RPC
+serialization option in the isolated validation processes. Native GEMM, sampling
+and prefill JIT modules were built once and reused. A healthy initial compilation
+hit its 900-second limit; one bounded continuation retained its Ninja outputs.
+The subsequent RPC-option failure is also preserved. No model, kernel, math or
+precision workaround was introduced. Managed autotuning reused 60/60 records;
+the native LM-head tactic fallback warning is retained rather than tuned away.
+Candidate anchors and all timing processes bound Rayon to two threads in addition
+to the existing math-library thread limits. The initial native anchor preceded
+that Rayon setting and is not used as a performance control.
+
+The decision plan and exact timing scope follow.
+
+The 16-case lifecycle suite is the measured starting point, not a model-speed
+claim. The existing attention benchmark constructs metadata before timing and
+uses MockLayer for FlashInfer. Do not relabel that measurement as full integration
+latency. Use the real LLM entry point for an anchor and the existing `vllm bench
+latency` completed-generation window for one matched workload. That window
+includes prefill, scheduling, metadata/planning and decode; it cannot isolate
+attention or Assign savings. No new benchmarking framework is needed.
+
+Reuse the already available NVFP4 Qwen checkpoint through a model-path argument.
+Its inspected text config is D256, 24Q/4KV (R6), 16 full-attention and 48 linear
+layers, so TP1 exercises the supported geometry. Stored weight shards occupy
+about 20.42 GiB; one 32 GiB SM120 device is a plausible anchor with bounded batch,
+context, token budget and Graph sizes. Admit only that idle device, preserve
+128 GiB available host memory, use two CPU/compiler threads and serial engines.
+Do not download another model or alter weights, quantization, MTP, GDN or native
+attention. No multi-GPU deployment gain is claimed by this rank-local anchor.
+
+First run native and explicit persistent/aligned through the real V1 model
+runner, using the same checkpoint, BF16 model activations, NVFP4 KV, page32,
+prefix caching off and matched execution configuration. Start with short
+generation on multiple prompts and changing request count. Collect finite
+outputs/logprobs and numerical comparisons on common-prefix positions; report
+token differences without bitwise or exact greedy-token equality gates. Use the
+existing public worker RPC to inspect builder eligibility/cache ownership as
+route evidence, never monkeypatch the model or kernel. A single targeted trace
+is justified only if that cannot establish which compute path ran.
+
+Keep the first engine setup bounded: max sequences8, max model length8192,
+max batched tokens1024, memory utilization0.90. If compilation would dominate
+this integration check, use a common explicit execution configuration for all
+arms and disclose it rather than compare different graph/compile modes. Model
+startup, cache allocation and stable runner metadata must work before timing.
+Material API/ABI or model-runner incompatibility returns to the lead; do not
+silently substitute a dummy model, rewrite dependencies or start broad rebuilds.
+
+After the anchor, use the official latency CLI with matched seed, fixed B8,
+input4096/output128, two warmups and ten measured batches, in native-before,
+persistent, aligned, native-after order. Retain every sample and bracket drift;
+stop after this one workload rather than open full service curves. Seed the
+existing random-input generation consistently and verify matched prompt geometry.
+Export completed latency JSON, source/runtime configuration and route evidence.
+Any observed gain is whole completed-generation latency for this configuration;
+it is neither pure decode latency nor a universal routing threshold.
+
+The 128-token output is deliberate: at a 1024-token prefill budget, eight 4096-token
+prompts require at least 32 prefill scheduling steps. A 32-token completion could
+finish early requests while others are still prefilling, leaving few pure-decode
+steps for this opt-in path. Longer output leaves a useful decode tail without
+raising prefill activation memory. Mixed steps still use native attention and
+remain inside the reported completed-generation time.
+
+Cold-build allowance: the source FlashInfer native GEMM modules may need first-use
+compilation even though the attention-only suite already passed. Preserve completed
+Ninja outputs. If the initial 900-second job ends solely while healthy compilers
+are progressing, one 1800-second continuation may use four compiler workers with
+two NVCC threads each; inference CPU threads remain two. Measured compiler RSS
+was about 1.7–3.8 GiB each against over 900 GiB available RAM. Confirm cleanup and
+resource admission before continuation. Do not spoof package versions or move
+unqualified JIT libraries between versioned caches.
 
 ### Compile boundary qualified before runtime migration (2026-10-31)
 
