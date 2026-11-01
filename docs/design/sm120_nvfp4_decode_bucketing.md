@@ -1,8 +1,9 @@
 # SM120 NVFP4 Decode bucketing contribution plan
 
-Status (2026-11-01): the opt-in q1 vLLM metadata/consumer integration is implemented
-on this contribution branch. Static checks and CPU configuration checks pass;
-real builder/consumer GPU tests, model validation and timing remain pending.
+Status (2026-11-02): the opt-in q1 vLLM metadata/consumer integration passed its
+16-case real builder/consumer GPU lifecycle suite, including CUDA Graph replay.
+Static and CPU configuration checks also pass. Model validation and timing remain
+pending; these layer-level checks do not establish model or serving speedups.
 No upstream pull request is open and the native default is unchanged.
 
 ## Current module expansion (2026-10-31)
@@ -460,6 +461,61 @@ Next validation is the focused lifecycle suite on one idle SM120 GPU, followed
 by a real model anchor and one matched timing window including metadata/planning.
 Only then decide whether wider workload evaluation is warranted. This development
 checkpoint is not a serving-speed claim or an upstream-PR readiness claim.
+
+### GPU integration qualification (2026-11-02, Asia/Shanghai)
+
+The implementation at [c70d1df](https://github.com/Nicko-F/vllm/commit/c70d1dfdb70aa071d5ba6d396e73ee4f5c4210bf)
+passed one focused smoke followed by all 16 selected lifecycle tests, with zero
+failures or skips, on one RTX 5090 (SM120), GPU7/NUMA1. The FlashInfer companion
+was [5b497c46](https://github.com/Nicko-F/flashinfer/commit/5b497c46dd51bd3b3a949c5ce712b7e9b14b6ea3).
+No implementation, test tolerances or fixtures changed to achieve these results.
+
+The 12 numerical lifecycle cases combine persistent/aligned and eager/Graph
+execution across the following real native NVFP4 cache layouts. Each case uses
+two sequential Attention implementations sharing one plan and scratch, while
+another builder owns independent storage. Padded batches change 8 -> 8 -> 4 -> 8
+with live request counts 4 -> 3 -> 2 -> 4; requests reorder, lengths grow, page IDs
+change and Graph outputs are poisoned before replay. Live outputs are compared
+against native XQA at the existing atol=rtol=0.02, with zero padded outputs.
+
+| Page size | KV heads | Q/KV ratio | Cache layout | B8 entry bytes | B4 entry bytes |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 16 | 1 | 4 | LBNHC | 413936 | 403568 |
+| 32 | 2 | 6 | BLHNC | 616728 | 588936 |
+| 64 | 4 | 8 | LBNHC | 873832 | 804024 |
+
+Bytes include the recorded plan tensors and scratch/semaphores, excluding KV
+storage and allocator bookkeeping. Both modes report the same allocation sizes.
+Three additional tests validate native metadata selection for default-off,
+B33 and cascade; the last validates non-evicting cache exhaustion and return to
+an existing entry. These are specific tested cases, not exhaustive validation of
+every unsupported configuration or concurrent runtime scenario.
+
+Commands, run identifiers and raw JUnit/logs were retained:
+
+```text
+python -m pytest -vv -s tests/v1/attention/test_attention_backends.py \
+  -k nvfp4_decode_bucket --junitxml=<run>/junit.xml
+
+smoke: flashinfer-buckets-vllm-smoke-20261101T165401Z
+suite: flashinfer-buckets-vllm-integration-20261101T165519Z
+```
+
+The run IDs use UTC. Suite elapsed time was 62.36 seconds including first-use JIT
+and pytest overhead; this is not an attention latency measurement. Final available
+host memory was 921.54 GiB. Earlier setup failures are preserved: the launcher
+initially resolved the private Python symlink to its base, test-only dependencies
+were missing, then nested FlashAttention extension links were missing. Fixes
+preserved the private interpreter, installed locked test dependencies privately,
+and reused installed compiled assets without a CUDA rebuild or base-environment
+mutation. No algorithm change was needed.
+
+The existing DGX Spark CI command selects these tests, but exact SM120 capability
+and the experimental dependency API are required. Spark/SM121 or released
+FlashInfer builds can skip them. This local 5090 result does not establish an
+upstream SM120 CI runner; appropriate CI hardware/dependency provisioning still
+needs maintainer agreement. A real-model entry-point check and matched timing
+including metadata refresh/planning remain the next bounded work.
 
 ### Compile boundary qualified before runtime migration (2026-10-31)
 
