@@ -1812,6 +1812,312 @@ def test_flashinfer_nvfp4_decode_correctness(
     torch.testing.assert_close(output, reference[rows], atol=2e-2, rtol=2e-2)
 
 
+def _require_flashinfer_decode_buckets():
+    try:
+        from flashinfer.xqa import (
+            create_xqa_decode_bucket_plan,
+            xqa_decode_with_buckets,
+        )
+    except ImportError:
+        pytest.skip("Requires FlashInfer's experimental decode-bucket APIs")
+    assert callable(create_xqa_decode_bucket_plan) and callable(xqa_decode_with_buckets)
+
+
+def _create_flashinfer_bucket_layers(tmp_path, mode, page_size, kv_heads, ratio):
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=kv_heads * ratio * 256,
+        head_dim=256,
+        num_attention_heads=kv_heads * ratio,
+        num_key_value_heads=kv_heads,
+        num_hidden_layers=2,
+        max_position_embeddings=16384,
+    ).save_pretrained(tmp_path)
+    config = create_vllm_config(
+        model_name=str(tmp_path),
+        max_model_len=16384,
+        dtype=torch.bfloat16,
+        block_size=page_size,
+        max_num_seqs=64,
+        max_num_batched_tokens=64,
+    )
+    config.cache_config.cache_dtype = "nvfp4"
+    config.attention_config.flashinfer_decode_bucket_mode = mode
+    with set_current_vllm_config(config):
+        layers = [
+            Attention(
+                kv_heads * ratio,
+                256,
+                256**-0.5,
+                num_kv_heads=kv_heads,
+                cache_config=config.cache_config,
+                prefix=f"layers.{i}.attn",
+                attn_backend=FlashInferBackend,
+            ).to("cuda")
+            for i in range(2)
+        ]
+    return config, create_standard_kv_cache_spec(config), layers
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
+    or not current_platform.is_device_capability(120),
+    reason="Decode buckets require FlashInfer and SM120.",
+)
+@pytest.mark.parametrize("mode", ["persistent", "aligned"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    "page_size,kv_heads,ratio,layout",
+    [(16, 1, 4, "LBNHC"), (32, 2, 6, "BLHNC"), (64, 4, 8, "LBNHC")],
+)
+def test_flashinfer_nvfp4_decode_bucket_lifecycle(
+    tmp_path, mode, use_cuda_graph, page_size, kv_heads, ratio, layout, record_property
+):
+    """Real builders refresh one shared plan for two ordered layer consumers.
+
+    Replays retain runner-owned page tables while requests reorder, grow,
+    disappear, and return to an earlier captured padded batch size.
+    """
+    import json
+
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    _require_flashinfer_decode_buckets()
+    set_random_seed(0)
+    device = torch.device("cuda")
+    config, spec, layers = _create_flashinfer_bucket_layers(
+        tmp_path, mode, page_size, kv_heads, ratio
+    )
+    config.cache_config.kv_cache_layout = layout
+    names = [layer.layer_name for layer in layers]
+    native_config = replace(
+        config,
+        attention_config=replace(
+            config.attention_config, flashinfer_decode_bucket_mode="off"
+        ),
+    )
+    with set_current_vllm_config(config):
+        builder = fi.FlashInferMetadataBuilder(spec, names, config, device)
+        independent = fi.FlashInferMetadataBuilder(spec, names, config, device)
+        native = fi.FlashInferMetadataBuilder(spec, names, native_config, device)
+    width = cdiv(16384, page_size)
+    page_tables = torch.zeros(8, width, dtype=torch.int32, device=device)
+    starts = 1 + torch.arange(4, device=device) * width
+    caches, queries, outputs, references = [], [], [], []
+    for layer in layers:
+        shape = (1 + 4 * width, page_size, 2 * kv_heads, nvfp4_kv_cache_full_dim(256))
+        if layout == "BLHNC":
+            cache = torch.zeros(
+                shape[0],
+                shape[2],
+                shape[1],
+                shape[3],
+                dtype=torch.uint8,
+                device=device,
+            )
+        else:
+            cache = torch.zeros(shape, dtype=torch.uint8, device=device).transpose(1, 2)
+        positions = torch.arange(2048, device=device)
+        slots = (starts[:, None] * page_size + positions).flatten()
+        key = torch.randn(4 * 2048, kv_heads, 256, dtype=torch.bfloat16, device=device)
+        value = torch.randn_like(key)
+        layer.impl.do_kv_cache_update(layer, key, value, cache, slots)
+        caches.append(cache)
+        queries.append(
+            torch.randn(8, kv_heads * ratio, 256, dtype=torch.bfloat16, device=device)
+        )
+        outputs.append(torch.empty_like(queries[-1]))
+        references.append(torch.empty_like(queries[-1]))
+
+    graphs = {}
+    saved = {}
+    stages = [
+        (8, [0, 1, 2, 3], [40, 300, 1027, 65]),
+        (8, [2, 0, 3], [1028, 41, 66]),
+        (4, [3, 1], [67, 301]),
+        (8, [1, 2, 0, 3], [302, 1030, 42, 68]),
+    ]
+    for batch, order, lengths in stages:
+        live = len(order)
+        for query in queries:
+            query.normal_()
+        page_tables.zero_()
+        page_tables[:live].copy_(
+            starts[order, None] + torch.arange(width, device=device)
+        )
+        common = replace(
+            create_common_attn_metadata(
+                BatchSpec(
+                    lengths + [123] * (batch - live), [1] * live + [0] * (batch - live)
+                ),
+                page_size,
+                device,
+            ),
+            block_table_tensor=page_tables[:batch],
+        )
+        metadata = builder.build(0, common)
+        native_metadata = native.build(0, common)
+        assert isinstance(metadata.decode, fi.FlashInferTrtllmAPIDecode)
+        assert isinstance(native_metadata.decode, fi.FlashInferTrtllmAPIDecode)
+        assert native_metadata.decode.buckets is None
+        buckets = metadata.decode.buckets
+        assert buckets is not None and not buckets.plan.direct
+        assert buckets.plan.planner == "gpu" and buckets.plan.mode == mode
+        torch.testing.assert_close(
+            buckets.plan.lengths.cpu(),
+            torch.tensor(lengths + [0] * (batch - live), dtype=torch.int32),
+        )
+        if batch in saved:
+            assert buckets is saved[batch]
+        saved[batch] = buckets
+        other_metadata = independent.build(0, common)
+        other = other_metadata.decode.buckets
+        assert other is not None
+        assert buckets.plan.lengths.data_ptr() != other.plan.lengths.data_ptr()
+        assert (
+            buckets.workspace.scratch.data_ptr() != other.workspace.scratch.data_ptr()
+        )
+        independent.build(0, replace(common, seq_lens=common.seq_lens + 1))
+        torch.testing.assert_close(
+            buckets.plan.lengths.cpu(),
+            torch.tensor(lengths + [0] * (batch - live), dtype=torch.int32),
+        )
+        descriptors = [x.clone() for x in (buckets.plan.tasks, buckets.plan.header)]
+
+        def forward(metadata=metadata, batch=batch):
+            for layer, query, cache, output in zip(layers, queries, caches, outputs):
+                layer.impl.forward(
+                    layer,
+                    query[:batch],
+                    None,
+                    None,
+                    cache,
+                    metadata,
+                    output=output[:batch],
+                )
+
+        forward()  # Warm compute before capture; planning has already completed.
+        if use_cuda_graph:
+            if batch not in graphs:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    forward()
+                graphs[batch] = graph
+            for output in outputs:
+                output[:batch].fill_(float("nan"))
+            graphs[batch].replay()
+        for layer, query, cache, output, reference in zip(
+            layers, queries, caches, outputs, references
+        ):
+            layer.impl.forward(
+                layer,
+                query[:batch],
+                None,
+                None,
+                cache,
+                native_metadata,
+                output=reference[:batch],
+            )
+            torch.testing.assert_close(
+                output[:live], reference[:live], atol=2e-2, rtol=2e-2
+            )
+            assert torch.count_nonzero(output[live:batch]) == 0
+        for actual, before in zip(
+            (buckets.plan.tasks, buckets.plan.header), descriptors
+        ):
+            torch.testing.assert_close(actual, before)
+    assert len(builder._decode_bucket_cache) == 2
+    entries = []
+    for (batch, table_width), buckets in builder._decode_bucket_cache.items():
+        buffers = [
+            buckets.plan.lengths,
+            buckets.plan.tasks,
+            buckets.plan.requests,
+            buckets.plan.spans,
+            buckets.plan.header,
+            buckets.plan.causal_mask,
+            buckets.workspace.scratch,
+            buckets.workspace.semaphores,
+        ]
+        entries.append(
+            dict(
+                batch=batch,
+                table_width=table_width,
+                bytes=sum(x.numel() * x.element_size() for x in buffers),
+            )
+        )
+    record_property("decode_bucket_entries", json.dumps(entries))
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
+    or not current_platform.is_device_capability(120),
+    reason="Decode bucket fallback requires FlashInfer and SM120.",
+)
+@pytest.mark.parametrize(
+    "mode,batch,prefix", [("off", 2, 0), ("aligned", 33, 0), ("persistent", 2, 16)]
+)
+def test_flashinfer_nvfp4_decode_bucket_native_fallback(tmp_path, mode, batch, prefix):
+    """Default selection, oversized batches and cascade keep native decode."""
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    if mode != "off":
+        _require_flashinfer_decode_buckets()
+    config, spec, layers = _create_flashinfer_bucket_layers(tmp_path, mode, 32, 1, 6)
+    device = torch.device("cuda")
+    with set_current_vllm_config(config):
+        builder = fi.FlashInferMetadataBuilder(
+            spec, [layer.layer_name for layer in layers], config, device
+        )
+    common = create_common_attn_metadata(
+        BatchSpec([300] * batch, [1] * batch), 32, device
+    )
+    metadata = builder.build(prefix, common)
+    assert isinstance(metadata.decode, fi.FlashInferTrtllmAPIDecode)
+    assert metadata.decode.kernel == fi.FlashInferDecodeKernel.XQA
+    assert metadata.decode.buckets is None
+    assert not builder._decode_bucket_cache
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
+    or not current_platform.is_device_capability(120),
+    reason="Decode bucket cache requires FlashInfer and SM120.",
+)
+def test_flashinfer_nvfp4_decode_bucket_cache_is_bounded(tmp_path):
+    """Width churn falls back without evicting storage held by earlier graphs."""
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    _require_flashinfer_decode_buckets()
+    config, spec, layers = _create_flashinfer_bucket_layers(
+        tmp_path, "aligned", 32, 1, 6
+    )
+    device = torch.device("cuda")
+    with set_current_vllm_config(config):
+        builder = fi.FlashInferMetadataBuilder(
+            spec, [layer.layer_name for layer in layers], config, device
+        )
+    common = create_common_attn_metadata(BatchSpec([1], [1]), 32, device)
+    first = builder.build(0, common).decode.buckets
+    assert first is not None
+    for width in range(2, 34):
+        metadata = builder.build(
+            0,
+            replace(
+                common,
+                block_table_tensor=torch.zeros(
+                    1, width, dtype=torch.int32, device=device
+                ),
+            ),
+        )
+        assert (metadata.decode.buckets is None) == (width == 33)
+    assert len(builder._decode_bucket_cache) == 32
+    assert builder.build(0, common).decode.buckets is first
+
+
 @pytest.mark.skipif(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST
     or current_platform.has_device_capability(90),

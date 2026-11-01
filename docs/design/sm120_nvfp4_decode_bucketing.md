@@ -1,8 +1,9 @@
 # SM120 NVFP4 Decode bucketing contribution plan
 
-Status: FlashInfer module validation; vLLM runtime integration is pending and no
-upstream pull request is open. This document is a working design on the
-contribution branch, not a claim that the backend is implemented in this checkout.
+Status (2026-11-01): the opt-in q1 vLLM metadata/consumer integration is implemented
+on this contribution branch. Static checks and CPU configuration checks pass;
+real builder/consumer GPU tests, model validation and timing remain pending.
+No upstream pull request is open and the native default is unchanged.
 
 ## Current module expansion (2026-10-31)
 
@@ -37,7 +38,8 @@ anchors above. The latter regressions already occur in compute, consistent with
 the extra row groups/KV reads needed by M16 for18logical rows versus native M32;
 that is a source-supported explanation, not a complete profiling attribution.
 The original native route remains default. Tile/dispatch decisions, real
-compile/opcheck coverage and framework integration remain subsequent work.
+compile/opcheck coverage and framework integration were subsequent work at that
+measurement point; later compile results and integration status are recorded below.
 The baseline in these module tables is the public FlashInfer
 `flashinfer.decode.xqa_batch_decode_with_kv_cache` call with native default
 dispatch, not a running vLLM model/server. Both arms use matched BF16 Q/output,
@@ -52,8 +54,8 @@ one64k+7x4k213.059 ->113.219us, and T5/R8 one64k+7x4k627.370 ->605.590us.
 The T3 mixed case is4.26x faster than native, but both balanced T3 cases remain
 slower. In uniform4096 even compute-only is224.323us against160.989us native;
 removing Assign alone cannot close that gap. Inspect native split/grid and bucket
-ownership/merge before changing scheduling. Real compile and vLLM integration
-remain unvalidated; source-level registration decorators are no proof of either.
+ownership/merge before changing scheduling. At that measurement point real compile
+and vLLM integration remained unvalidated; subsequent results are recorded below.
 
 The [ownership diagnosis](https://github.com/Nicko-F/flashinfer/commit/3aa1974545599c6b6619f19628cb2c25232109ca) compared existing persistent/aligned M32 on
 matched GPU7/NUMA1, independently of the earlier GPU0 timings. For uniform4096,
@@ -189,7 +191,8 @@ does not change the kernels already recorded inside it. Decide that selection
 after the source-level module measurements, rather than copying an unverified
 research dispatch threshold.
 
-This is an integration design, not an implemented or measured vLLM path yet.
+The q1 GPU-planned slice below now implements this boundary. Runtime validation
+and model measurements remain pending; this design alone establishes neither.
 
 ### Host or GPU planning (owner decision, 2026-10-30)
 
@@ -367,6 +370,96 @@ physical GPU ordinal or assume 170 SMs.
 - Keep local experiment admission and memory safeguards outside reusable kernels.
 
 ## Bounded migration sequence
+
+### Active slice: real builder/implementation integration (2026-11-01)
+
+Measured starting point: public FlashInfer compilation and shared-plan replay
+are qualified. The last balanced two-layer window was 330.102 us with shared
+eager planning versus a 320.325 us native mean; this does not justify automatic
+selection. Retain native as the default and expose explicit persistent/aligned
+experimental selection in AttentionConfig. Keep the mode fixed for capture.
+
+Source basis: GPUModelRunner._build_attention_metadata shares one builder result
+across an attention group's layers and creates separate builders for microbatches.
+FlashInfer does not advertise update_block_table reuse. Its builder constructs
+FlashInferTrtllmAPIDecode once, and its XQA forward already supplies effective
+BMM1/BMM2 scales and zero-copy NVFP4 data/scale views. Adapt these boundaries;
+do not add worker scheduling, monkeypatch installed packages or rewrite attention.
+
+Initial runtime contract is pure-decode, causal, non-speculative q1, BF16 Q/output, NVFP4 KV,
+SM120, D256, page16/32/64, supported head ratios4/6/8 and padded B1-32. No DCP,
+sliding window, sinks, softcap, batch-invariant mode or cascade attention. Other
+cases retain the native route. The FlashInfer module's multi-query and Host
+planner options remain intact; this first runtime slice uses its GPU planner.
+Missing experimental dependency APIs should fail clearly on explicit selection,
+not silently pretend the requested route ran. Validate capabilities, not hashes.
+
+Each builder owns a bounded cache of stable length buffers, plans and scratch
+keyed by padded batch and page-table geometry; other geometry is builder-static.
+Refresh current lengths into the stable buffer and prepare once before forward.
+Zero inactive padded rows using existing CPU query-count metadata, without a
+GPU-to-CPU readback. Reuse scratch only across sequential layers; independent
+builders/microbatches own independent storage. Native runner block-table storage
+and page-ID updates retain their existing Graph lifecycle. Do not cache a stale
+view of the first batch. Allocation/JIT occurs before Graph capture, never in
+per-layer forward. Preserve the original NVFP4 views without repacking.
+
+Resource model: plans contain O(B + CTA capacity) descriptors and O(B) lengths.
+Scratch is the existing FlashInfer bounded native partial buffer, not KV-context
+storage. Record actual per-entry bytes and cached entry count in focused tests;
+the supported B1-32 bound limits cached request cardinalities. A normal runner
+has one fixed page-table width. Keep at most 32 non-evicting entries; unexpected
+width churn beyond that cache uses the native route with a one-time diagnostic,
+without invalidating any graph-live plan or throwing an arbitrary capacity error.
+Existing keys retain their buffers and route. No per-layer copy
+of a capacity-sized workspace and no unbounded cache keyed by live lengths.
+
+Implement the coupled config/metadata/consumer changes, then extend nearby real
+FlashInfer builder tests. Check default/native fallback, both explicit modes,
+padding/removal, reordered requests/page IDs, length growth and returning to a
+previous captured batch size, two sequential layer consumers and independent
+builders. Test actual constructors and GPU operators rather than mocked routing.
+An appropriate single-rank builder/implementation anchor precedes a real-model
+entry-point check; do not start full service curves in this slice. Reuse existing
+benchmark helpers for one matched native/candidate window including external
+metadata refresh/planning. Do not compare that wall window to prior GPU-only
+timings. If dependency/API drift blocks real imports, report it before changing
+the environment broadly. Preserve existing installations in private environments.
+
+One Sol executor owns implementation/tests and bounded remote work; the lead
+owns this design and reviews critical diffs/raw evidence before publication.
+Only selected idle GPUs are required, with MemAvailable >=128 GiB, bounded
+threads and existing heartbeat/process controls. Material design changes return
+to the lead; ordinary fixes do not need a new user approval.
+
+### Integration implementation review and validation status (2026-11-01)
+
+The config, metadata owner and forward consumer are now implemented together.
+The lead reviewed the source path, native NVFP4 views/scales, plan lifetime,
+bounded non-evicting cache and sequential scratch ownership. The native path
+stays default; no dispatch thresholds or kernel mathematics changed. The compute
+entry retains native PDL dependency acquisition before descriptor/length reads.
+
+Nearby tests use real Attention layers and builders. They cover both modes,
+eager/Graph execution, three page/head/layout combinations, refreshed lengths,
+request reorder/removal, changed page IDs, returning to a captured batch, two
+consumers sharing the same scratch, independent builders, and native fallback.
+Outputs are poisoned before Graph replay to expose stale-output/no-op mistakes.
+Custom-path tests explicitly skip when the optional experimental FlashInfer API
+is unavailable; an explicit runtime opt-in still reports that missing dependency.
+
+Ruff check/format, AST and whitespace checks passed. Actual CPU configuration
+construction accepted all three modes with distinct compute hashes and rejected
+an invalid mode; CUDA was not initialized. The final resource check found all
+eight GPUs occupied, so no GPU tests, GPU test collection, model validation or
+new performance measurements ran. These remain pending, not passed or inferred
+from earlier standalone FlashInfer measurements. A private source environment is
+being prepared without modifying the existing deployment environment.
+
+Next validation is the focused lifecycle suite on one idle SM120 GPU, followed
+by a real model anchor and one matched timing window including metadata/planning.
+Only then decide whether wider workload evaluation is warranted. This development
+checkpoint is not a serving-speed claim or an upstream-PR readiness claim.
 
 ### Compile boundary qualified before runtime migration (2026-10-31)
 

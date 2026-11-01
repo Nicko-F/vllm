@@ -54,6 +54,40 @@ llm = LLM(
 )
 ```
 
+### Experimental FlashInfer NVFP4 decode buckets
+
+`AttentionConfig.flashinfer_decode_bucket_mode` accepts `"off"` (the default),
+`"persistent"`, or `"aligned"`. The two experimental modes change decode work
+scheduling; neither is selected automatically or guarantees a speedup.
+
+```bash
+vllm serve <model> --attention-config.backend FLASHINFER \
+    --kv-cache-dtype nvfp4 \
+    --attention-config.flashinfer_decode_bucket_mode aligned
+```
+
+This requires a FlashInfer build exposing `create_xqa_decode_bucket_plan` and
+`xqa_decode_with_buckets`. Explicit selection reports an error when those APIs
+are missing. Supported decode uses SM120, BF16 queries/output, NVFP4 KV,
+head dimension 256, page sizes 16/32/64, 4/6/8 query heads per KV head, and
+1–32 padded requests. Each request has one causal query token. Speculative
+decoding, mixed prefill/decode batches, DCP, sliding windows, sinks, soft caps,
+cascade attention and batch-invariant mode retain native FlashInfer scheduling,
+as do unsupported shapes and dtypes. Other attention backends are unchanged.
+
+The metadata builder refreshes device lengths and prepares one GPU plan before
+the model runs. Sequential layers share the plan and scratch; independent
+builders and microbatches own separate storage. Planning is outside the model
+CUDA Graph, so latency comparisons must include metadata refresh and planning.
+The selected mode is fixed for a captured shape.
+
+Each builder retains at most 32 plans keyed by padded request count and page-table
+width. The runner normally keeps that width fixed. Cached storage is retained
+for existing CUDA Graphs; additional geometries after the cache is full use
+native decode and emit a diagnostic. Page IDs continue to use the runner's
+existing block-table storage and update lifecycle. Plans contain bounded work
+descriptors and native partial-result scratch, without copying the KV cache.
+
 ## Backend Selection Behavior
 
 ### Triton/FlashAttention Composite

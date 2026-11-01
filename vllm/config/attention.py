@@ -80,6 +80,11 @@ class AttentionConfig:
     disable_flashinfer_q_quantization: bool = False
     """If set, when using fp8 kv, do not quantize Q to fp8."""
 
+    flashinfer_decode_bucket_mode: Literal["off", "persistent", "aligned"] = "off"
+    """Experimental SM120 NVFP4 single-token decode work scheduling. Requires
+    FlashInfer's experimental decode-bucket APIs. Unsupported configurations
+    use the native FlashInfer path; "off" preserves native scheduling."""
+
     mla_prefill_backend: MLAPrefillBackendEnum | None = None
     """MLA prefill backend to use. If None, will be selected automatically.
     Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED."""

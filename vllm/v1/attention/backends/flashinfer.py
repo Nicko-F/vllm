@@ -5,7 +5,7 @@
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -99,6 +99,12 @@ from vllm.v1.kv_cache_interface import (
     iter_layer_specs,
 )
 from vllm.v1.utils import CpuGpuBuffer
+
+if TYPE_CHECKING:
+    from flashinfer.experimental.xqa_decode_buckets.backend import (
+        BucketPlan,
+        BucketWorkspace,
+    )
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM = 16
@@ -791,6 +797,14 @@ class TRTLLMPrefill:
 
 
 @dataclass
+class FlashInferDecodeBuckets:
+    """Builder-owned storage shared only by sequential attention consumers."""
+
+    plan: "BucketPlan"
+    workspace: "BucketWorkspace"
+
+
+@dataclass
 class FlashInferTrtllmAPIDecode:
     """Metadata for XQA and trtllm-gen decode."""
 
@@ -822,6 +836,9 @@ class FlashInferTrtllmAPIDecode:
 
     dcp_query_start_loc: torch.Tensor | None = None
     """Decode query boundaries for masking empty DCP shards during reduction."""
+
+    buckets: FlashInferDecodeBuckets | None = None
+    """Experimental plan prepared once by the builder, outside model capture."""
 
 
 @dataclass
@@ -872,6 +889,26 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.cache_config = vllm_config.cache_config
         self.model_config = vllm_config.model_config
         self.attention_config = vllm_config.attention_config
+        self._decode_bucket_mode = self.attention_config.flashinfer_decode_bucket_mode
+        self._decode_bucket_cache: dict[tuple[int, int], FlashInferDecodeBuckets] = {}
+        self._create_decode_bucket_plan = None
+        if self._decode_bucket_mode != "off":
+            try:
+                from flashinfer.xqa import (
+                    create_xqa_decode_bucket_plan,
+                    xqa_decode_with_buckets,
+                )
+            except ImportError as error:
+                raise RuntimeError(
+                    "flashinfer_decode_bucket_mode requires FlashInfer's "
+                    "experimental create_xqa_decode_bucket_plan and "
+                    "xqa_decode_with_buckets APIs."
+                ) from error
+            if not callable(create_xqa_decode_bucket_plan) or not callable(
+                xqa_decode_with_buckets
+            ):
+                raise RuntimeError("FlashInfer decode-bucket APIs must be callable")
+            self._create_decode_bucket_plan = create_xqa_decode_bucket_plan
         self._num_speculative_tokens = vllm_config.num_speculative_tokens
         self._workspace_buffer = None
         self._prefill_wrapper: (
@@ -1090,6 +1127,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if self.use_trtllm_dcp_prefill:
             logger.info_once("Using the trtllm-gen context kernel for DCP prefill.")
         self.has_sinks = self.global_hyperparameters.has_sinks
+        self._use_decode_buckets = (
+            self._decode_bucket_mode != "off"
+            and self.use_xqa
+            and self.is_kvcache_nvfp4
+            and current_platform.is_device_capability(120)
+            and self.model_config.dtype == torch.bfloat16
+            and self.q_data_type_decode == torch.bfloat16
+            and self.head_dim == 256
+            and self.page_size in (16, 32, 64)
+            and self.num_qo_heads % self.num_kv_heads == 0
+            and self.num_qo_heads // self.num_kv_heads in (4, 6, 8)
+            and self._num_speculative_tokens == 0
+            and not self.use_dcp
+            and self.global_hyperparameters.has_same_all_params
+            and self.window_left == -1
+            and not self.logits_soft_cap
+            and not self.has_sinks
+            and not envs.VLLM_BATCH_INVARIANT
+        )
         if self.has_sinks and (self.nvfp4_fa2 or not FlashInferBackend.supports_sink()):
             raise NotImplementedError(
                 "FlashInfer backend currently does not support attention "
@@ -1122,6 +1178,57 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_last_page_len = CpuGpuBuffer(
             max_num_reqs, dtype=torch.int32, device=self.device, pin_memory=False
         )
+
+    def _prepare_decode_buckets(
+        self,
+        seq_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        num_decode_tokens: int,
+    ) -> FlashInferDecodeBuckets | None:
+        batch, table_width = block_tables.shape
+        if not 1 <= batch <= 32 or table_width == 0:
+            return None
+        query_lens = query_start_loc_cpu[1 : batch + 1] - query_start_loc_cpu[:batch]
+        # XQA q1 maps query row i to request i; inactive graph rows trail live rows.
+        if not bool(torch.all(query_lens[:num_decode_tokens] == 1)) or not bool(
+            torch.all(query_lens[num_decode_tokens:] == 0)
+        ):
+            return None
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Decode bucket metadata must be prepared before capture")
+        key = (batch, table_width)
+        buckets = self._decode_bucket_cache.get(key)
+        if buckets is None:
+            # Never evict storage referenced by an already captured model graph.
+            if len(self._decode_bucket_cache) >= 32:
+                logger.warning_once(
+                    "FlashInfer decode bucket cache reached 32 page-table "
+                    "geometries; using native decode for additional geometries. "
+                    "The model runner normally keeps page-table width fixed."
+                )
+                return None
+            lengths = torch.empty(batch, dtype=torch.int32, device=self.device)
+        else:
+            lengths = buckets.plan.lengths
+        lengths.copy_(seq_lens)
+        lengths[num_decode_tokens:].zero_()
+        if buckets is None:
+            assert self._create_decode_bucket_plan is not None
+            plan = self._create_decode_bucket_plan(
+                lengths,
+                page_table_width=table_width,
+                page_size=self.page_size,
+                num_kv_heads=self.num_kv_heads,
+                head_group_ratio=self.num_qo_heads // self.num_kv_heads,
+                mode=self._decode_bucket_mode,
+                planner="gpu",
+            )
+            buckets = FlashInferDecodeBuckets(plan, plan.create_workspace())
+            self._decode_bucket_cache[key] = buckets
+        else:
+            buckets.plan.prepare()
+        return buckets
 
     @property
     def kv_cache_layout(self) -> KVCacheLayout:
@@ -1933,6 +2040,20 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         qo_indptr[: num_decodes + 1] if self.use_dcp else None
                     ),
                 )
+                if (
+                    self._use_decode_buckets
+                    and causal
+                    and common_prefix_len == 0
+                    and num_prefills == 0
+                    and q_len_per_req == 1
+                    and q_cu_seq_lens is None
+                ):
+                    attn_metadata.decode.buckets = self._prepare_decode_buckets(
+                        seq_lens_decode,
+                        attn_metadata.decode.block_tables,
+                        qo_indptr_cpu,
+                        num_decode_tokens,
+                    )
             else:
                 assert seq_lens_cpu is not None
                 pure_decode = num_prefills == 0
@@ -2336,13 +2457,14 @@ class FlashInferImpl(AttentionImpl):
         hs = self.head_size
         nvfp4_kv_data = None
         nvfp4_kv_block_scales = None
+        nvfp4_kv_layout = None
         if self.is_kvcache_nvfp4:
             k_cache, v_cache = kv_cache.split(self.num_kv_heads, dim=1)
             kv_cache_tuple = (
                 canonicalize_singleton_dim_strides(k_cache.permute(*stride_order)),
                 canonicalize_singleton_dim_strides(v_cache.permute(*stride_order)),
             )
-            nvfp4_kv_data, nvfp4_kv_block_scales, _ = _nvfp4_kv_views(
+            nvfp4_kv_data, nvfp4_kv_block_scales, nvfp4_kv_layout = _nvfp4_kv_views(
                 kv_cache, self.num_kv_heads
             )
         else:
@@ -2653,9 +2775,45 @@ class FlashInferImpl(AttentionImpl):
                 # degenerate strides on size=1 dims for TMA alignment.
                 decode_query = decode_query.contiguous()
                 decode_query = canonicalize_singleton_dim_strides(decode_query)
-                workspace_buffer = _get_trtllm_workspace_buffer()
                 block_tables_decode = attn_metadata.decode.block_tables
                 seq_lens_decode = attn_metadata.decode.seq_lens
+                buckets = attn_metadata.decode.buckets
+                if (
+                    decode_with_xqa
+                    and buckets is not None
+                    and decode_query.dtype == torch.bfloat16
+                    and output_padded.dtype == torch.bfloat16
+                ):
+                    from flashinfer.xqa import xqa_decode_with_buckets
+
+                    assert nvfp4_kv_data is not None
+                    assert nvfp4_kv_block_scales is not None
+                    k_data, v_data = nvfp4_kv_data
+                    k_scales, v_scales = nvfp4_kv_block_scales
+                    if nvfp4_kv_layout == "HND":
+                        k_data, v_data = k_data.transpose(1, 2), v_data.transpose(1, 2)
+                        k_scales, v_scales = (
+                            k_scales.transpose(1, 2),
+                            v_scales.transpose(1, 2),
+                        )
+                    xqa_decode_with_buckets(
+                        decode_query,
+                        k_data,
+                        v_data,
+                        k_scales,
+                        v_scales,
+                        block_tables_decode,
+                        buckets.plan,
+                        buckets.workspace,
+                        bmm1_scale=self.get_xqa_bmm1_scale(
+                            layer, attn_metadata.q_data_type_decode
+                        ),
+                        bmm2_scale=self.bmm2_scale,
+                        out=output_padded[:decode_query_tokens],
+                    )
+                    return output_padded
+
+                workspace_buffer = _get_trtllm_workspace_buffer()
 
                 # trtllm-gen needs HND layout on SM100. XQA is selected
                 # separately on SM90 and does not use this SM100 layout gate.
